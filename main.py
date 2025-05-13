@@ -106,7 +106,7 @@ def main(
         test_loader = DataLoader(
             test_set,  
             shuffle=False,  
-            batch_size=len(test_set) 
+            batch_size=128
         )
 
     validation_loader = DataLoader(
@@ -128,7 +128,6 @@ def main(
         persistent_workers=True,
         pin_memory=True,
         drop_last=True  
-  
     )   
     
     writer = SummaryWriter(log_dir=os.path.join(results_path, "tensorboard", f"BS_{train_batch_size}_LR_{learning_rate:.0e}_WD_{weight_decay:.0e}_M_{momentum}"))    
@@ -235,8 +234,8 @@ def main(
 
 if __name__ == "__main__":
     main(
-        train_batch_size=16, 
-        num_epochs=10, 
+        train_batch_size=32, 
+        num_epochs=100, 
         learning_rate=1e-3, 
         weight_decay=1e-2, 
         momentum=.99, 
