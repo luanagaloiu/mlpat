@@ -8,23 +8,40 @@ import pandas as pd
 import os
 
 
-def pad_or_truncate(npz, target_length_0):
+def pad_or_truncate(npz_f, target_length_0, target_length_1, selected_features=None):
     processed = {}
-    for key, value in list(npz.items()):
-        array = np.array(value, dtype=np.float32)
-        current_length_0 = array.shape[0]
-        # Only operate on dimension 0
-        if current_length_0 == target_length_0:
-            processed[key] = torch.tensor(value, dtype=torch.float32)
-        elif current_length_0 > target_length_0:
-            indices = [slice(None)] * array.ndim
-            indices[0] = slice(0, target_length_0)
-            processed[key] = torch.from_numpy(array[tuple(indices)])
-        else:
-            padding_needed = target_length_0 - current_length_0
-            pad_width = [(0, 0)] * array.ndim
-            pad_width[0] = (0, padding_needed)
-            processed[key] = torch.from_numpy(np.pad(array, pad_width, mode='constant', constant_values=0))
+    for key in selected_features:
+        if hasattr(npz_f, key):
+            array = np.array(getattr(npz_f, key), dtype=np.float32)
+            current_length_0 = array.shape[0]
+            current_length_1 = array.shape[1]
+            if current_length_0 == target_length_0 and current_length_1 == target_length_1:
+                processed[key] = array
+            elif current_length_0 > target_length_0:
+                indices = [slice(None)] * array.ndim
+                indices[0] = slice(0, target_length_0)
+                if current_length_1 > target_length_1:
+                    indices[1] = slice(0, target_length_1)
+                    processed[key] = array[tuple(indices)]
+                else:
+                    # Pad axis 1 if needed after truncating axis 0
+                    pad_width = [(0, 0)] * array.ndim
+                    pad_width[0] = (0, 0)
+                    pad_width[1] = (0, target_length_1 - current_length_1)
+                    processed[key] = np.pad(array[tuple(indices)], pad_width, mode='constant', constant_values=0)
+            else:
+                padding_needed = target_length_0 - current_length_0
+                pad_width = [(0, 0)] * array.ndim
+                pad_width[0] = (0, padding_needed)
+                if current_length_1 > target_length_1:
+                    # Truncate axis 1 after padding axis 0
+                    indices = [slice(None)] * array.ndim
+                    indices[1] = slice(0, target_length_1)
+                    processed[key] = np.pad(array, pad_width, mode='constant', constant_values=0)[tuple(indices)]
+                else:
+                    # Pad axis 1 as well
+                    pad_width[1] = (0, target_length_1 - current_length_1)
+                    processed[key] = np.pad(array, pad_width, mode='constant', constant_values=0)
     return processed
 
 
@@ -35,15 +52,25 @@ class MLPC2025(Dataset):
     base_dir = "MLPC2025_classification"
 
     def __init__(
-        self,
-        audio_features_dir="audio_features",
-        labels_dir="labels",
-        features_length_0=250,
+            self,
+            audio_features_dir="audio_features",
+            labels_dir="labels",
+            num_classes=54,
+            features_length_0=250,
+            selected_features=None
     ):
         self.features_length_0 = features_length_0
         self.audio_features_dir = path.join(self.base_dir, audio_features_dir)
+        self.selected_features = selected_features if selected_features is not None else [
+            'embeddings', 'melspectrogram', 'mfcc', 'mfcc_delta', 'mfcc_delta2',
+            'flatness', 'centroid', 'flux', 'energy', 'power', 'bandwidth',
+            'contrast', 'zerocrossingrate'
+        ]
         self.labels_dir = path.join(self.base_dir, labels_dir)
         self.file_pairs = self._find_and_pair_files()
+        self.num_classes = num_classes
+        self.longest_feature = self.find_biggest_selected_features()
+              
 
     def _find_and_pair_files(self):
         """Finds feature files and pairs them with existing corresponding label files."""
@@ -61,13 +88,18 @@ class MLPC2025(Dataset):
         
         return paired_files
     
-
+    def find_biggest_selected_features(self):
+        filepath_features = self.file_pairs[0][0]
+        features_npz = np.load(filepath_features)
+        lengths = [getattr(features_npz.f, key).shape[1] for key in self.selected_features ]
+        return max(lengths)
 
     def __getitem__(self, index):
         filepath_features, filepath_labels = self.file_pairs[index]
+        
         features_npz = np.load(filepath_features)
         labels_npz = np.load(filepath_labels)
-        features_dict = pad_or_truncate(features_npz, self.features_length_0)
+        features_dict = pad_or_truncate(features_npz.f, self.features_length_0, self.longest_feature, self.selected_features)
         labels_list =list(labels_npz.values())
         classes = list(labels_npz.keys())
         class_id = None
@@ -76,28 +108,18 @@ class MLPC2025(Dataset):
                 class_id = i
                 break
         class_name = classes[class_id]
+        # Convert to PyTorch tensors (dict of tensors)
+        features_tensor =  torch.from_numpy(np.array(list(features_dict.values())))
+
         
-        return {
-            'melspectrogram': features_dict["melspectrogram"].unsqueeze(0), 
-            'embeddings': features_dict["embeddings"],
-            'mfcc': torch.from_numpy(np.array([features_dict["mfcc"], features_dict["mfcc_delta"], features_dict["mfcc_delta2"]])),
-            'bandwidth': features_dict["bandwidth"].squeeze(),
-            'centroid': features_dict["centroid"].squeeze(),
-            'energy': features_dict["energy"].squeeze(),
-            'flatness': features_dict["flatness"].squeeze(),
-            'flux': features_dict["flux"].squeeze(),
-            'power': features_dict["power"].squeeze(),
-            'zerocrossingrate': features_dict["zerocrossingrate"].squeeze(),
-            'class_id': class_id, 
-            'class_name': class_name,
-        }
+        return features_tensor, class_id, class_name
 
     def __len__(self):
         return len(self.file_pairs)
 
 # data_loader = MLPC2025()
 # for i in range(len(data_loader)):
-#     first = data_loader[i]
+#     features, class_id, class_name = data_loader[i]
 
 
 

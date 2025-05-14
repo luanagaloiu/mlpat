@@ -19,14 +19,7 @@ from sklearn.metrics import f1_score
 
 
 
-def evaluate_model(
-    model: torch.nn.Module, 
-    loader: torch.utils.data.DataLoader, 
-    loss_fn, 
-    device: torch.device, 
-    primary_feature = "melspectrogram",
-    scalar_features = [ "centroid", "energy","zerocrossingrate"]
-):
+def evaluate_model(model: torch.nn.Module, loader: torch.utils.data.DataLoader, loss_fn, device: torch.device):
     """Function for evaluation of a model ``model`` on the data in
     ``loader`` on device ``device``, using the specified ``loss_fn`` loss
     function."""
@@ -38,20 +31,16 @@ def evaluate_model(
     macro_f1 = 0
     with torch.no_grad():  
         for data in tqdm(loader, desc="Evaluating", position=0, leave=False):
-            input = data[primary_feature]
-            input = input.to(device)
-            input_scalar = [data[feature] for feature in scalar_features]
-            input_scalar = [feature.to(device) for feature in input_scalar]
-            class_id = data['class_id']
-            class_id = class_id.to(device)
-
-            outputs = model(input, input_scalar)
-            loss += loss_fn(outputs, class_id).item()
+            inputs, targets, _ = data
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            outputs = model(inputs)
+            loss += loss_fn(outputs, targets).item()
             _, predicted = torch.max(outputs.data, 1)
-            total += class_id.size(0)
-            correct += (predicted == class_id).sum().item()
+            total += targets.size(0)
+            correct += (predicted == targets).sum().item()
             macro_f1 += f1_score(
-                y_true=class_id.cpu().numpy(),
+                y_true=targets.cpu().numpy(),
                 y_pred=torch.argmax(outputs, dim=1).cpu().numpy(),
                 average='macro'
             )
@@ -71,23 +60,27 @@ def main(
     num_epochs: int = 3, 
     train_batch_size: int = 16,
     momentum: float = 0.9,
-    skip_test: bool = False,
-    early_stopping_threshold: int = 15,
-    primary_feature = "melspectrogram",
-    scalar_features = [ "centroid", "energy","zerocrossingrate"]
+    test: bool = True,
+    early_stopping_threshold: int = 30,
+    selected_features: list[str] = None
+    
 ):
     print(f"Batch: {train_batch_size} | LR: {learning_rate:.0e} | WD: {weight_decay:.0e} | Momentum: {momentum}")
-    model = MyCNN(1, 58)
+    model = MyCNN(
+        num_features = 13 if selected_features is None else len(selected_features),  # Number of input channels
+        num_classes = 58  # Number of output classes
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
     np.random.seed(0)
     torch.manual_seed(0)
 
-    dataset = MLPC2025()
+    #dataset             
+    dataset = MLPC2025(selected_features=selected_features)
 
     #Split dataset into training and validation sets
-    training_size = int(len(dataset) * (3 / 5)) if not skip_test else int(len(dataset) * (4 / 5))
-    validation_size = int(len(dataset) * (4 / 5)) if not skip_test else len(dataset)
+    training_size = int(len(dataset) * (3 / 5)) if test else int(len(dataset) * (4 / 5))
+    validation_size = int(len(dataset) * (4 / 5)) if test else len(dataset)
     
     training_set = Subset(
         dataset,
@@ -98,7 +91,7 @@ def main(
         indices=np.arange(training_size, validation_size)
     )
 
-    if not skip_test:
+    if test:
         test_set = Subset(
             dataset,
             indices=np.arange(validation_size, len(dataset))
@@ -106,7 +99,7 @@ def main(
         test_loader = DataLoader(
             test_set,  
             shuffle=False,  
-            batch_size=128
+            batch_size=len(test_set) 
         )
 
     validation_loader = DataLoader(
@@ -128,6 +121,7 @@ def main(
         persistent_workers=True,
         pin_memory=True,
         drop_last=True  
+  
     )   
     
     writer = SummaryWriter(log_dir=os.path.join(results_path, "tensorboard", f"BS_{train_batch_size}_LR_{learning_rate:.0e}_WD_{weight_decay:.0e}_M_{momentum}"))    
@@ -160,24 +154,23 @@ def main(
         model.train()
         
         for i, data in enumerate(training_loader):
-            input = data[primary_feature]
-            input = input.to(device)
-            input_scalar = [data[feature] for feature in scalar_features]
-            input_scalar = [feature.to(device) for feature in input_scalar]
-            class_id = data['class_id']
-            class_id = class_id.to(device)
+            features_tensor, classid, _ = data
             
+            
+
+            features_tensor = features_tensor.to(device)
+            classid = classid.to(device)
             optimizer.zero_grad()
             if torch.cuda.is_available():
                 with autocast():
-                    output = model(input, input_scalar)
-                    loss = loss_function(output, class_id)
+                    output = model(features_tensor)
+                    loss = loss_function(output, classid)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                output = model(input, input_scalar)
-                loss = loss_function(output, class_id)
+                output = model(features_tensor)
+                loss = loss_function(output, classid)
                 loss.backward()
                 optimizer.step()
             scheduler.step()
@@ -203,44 +196,42 @@ def main(
         writer.add_scalar(tag="Accuracy/Validation", scalar_value=val_acc, global_step=epoch)
         writer.add_scalar(tag="F1/Validation", scalar_value=macro_f1, global_step=epoch)
 
+        
+       
             
-        if epoch - best_loss_epoch > early_stopping_threshold:
-            print("early stopping")
-            break
+        # if epoch - best_loss_epoch > early_stopping_threshold:
+        #     print("early stopping")
+        #     break #early stopping
 
     print("Finished Training!")
     update_progress_bar.close()
     writer.close()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
     gc.collect()
 
     print(f"Computing scores for best model")
     model.load_state_dict(torch.load(saved_model_file))
-    train_loss, train_acc, train_macro_f1 = evaluate_model(model, training_loader, loss_function, device)
-    val_loss, val_acc, val_macro_f1 = evaluate_model(model, validation_loader, loss_function, device)
-    if not skip_test:
-        test_loss, test_acc, test_macro_f1 = evaluate_model(model, test_loader, loss_function, device)
+    train_loss, train_acc, macro_f1 = evaluate_model(model, training_loader, loss_function, device)
+    val_loss, val_acc, macro_f1 = evaluate_model(model, validation_loader, loss_function, device)
+    if test:
+        test_loss, test_acc, macro_f1 = evaluate_model(model, test_loader, loss_function, device)
     
     print(f"Scores:")
-    print(f"  f1 / training loss / accuracy: {train_macro_f1} / {train_loss} / {train_acc * 100}%")
-    print(f"  f1 / validation loss / accuracy: {val_macro_f1} / {val_loss} / {val_acc * 100}%")
-    if not skip_test:
-        print(f"  f1 / test loss / accuracy: {test_macro_f1} / {test_loss} / {test_acc * 100}%\n")
+    print(f"  training loss / accuracy: {train_loss} / {train_acc * 100}%")
+    print(f"  validation loss / accuracy: {val_loss} / {val_acc * 100}%")
+    print(f"  Macro F1: {macro_f1}")
+    if test:
+        print(f"  test loss / accuracy: {test_loss} / {test_acc * 100}%\n")
         os.rename(saved_model_file, saved_model_file.replace("model", f"Acc_{test_acc:1.4f}_Loss_{test_loss:1.4f}_E{best_loss_epoch}-{num_epochs}"))
 
 
 if __name__ == "__main__":
     main(
-        train_batch_size=32, 
-        num_epochs=100, 
+        train_batch_size=16, 
+        num_epochs=10, 
         learning_rate=1e-3, 
         weight_decay=1e-2, 
         momentum=.99, 
-        primary_feature = "melspectrogram",
-        scalar_features = [ "centroid", "energy","zerocrossingrate"]
+        selected_features =['zerocrossingrate', 'centroid', 'embeddings'] 
     )
 
     # for bs in [128, 96]:
